@@ -1,0 +1,9 @@
+# rivet dogfoods itself: its own specs live in specs/ and are tracked through it.
+adapter  = "lane"
+specs    = ["specs"]
+project  = "OSA"
+base_url = "https://jiradg.atlassian.net"
+
+[types]
+story = "Story"
+task  = "Technical task"

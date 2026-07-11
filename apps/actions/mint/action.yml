@@ -1,0 +1,26 @@
+name: "rivet mint"
+description: "On the `create-jira` label, create issues for keyless Ready specs and stamp their H1s back to the PR branch."
+runs:
+  using: composite
+  steps:
+    - uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: "1.3.3"
+    - shell: bash
+      run: bun install --frozen-lockfile
+    - shell: bash
+      # Credentials come from repo/org secrets (a dedicated Jira service account).
+      env:
+        JIRA_EMAIL: ${{ env.JIRA_EMAIL }}
+        JIRA_API_TOKEN: ${{ env.JIRA_API_TOKEN }}
+        JIRA_BASE_URL: ${{ env.JIRA_BASE_URL }}
+      run: bun run apps/cli/src/main.ts mint .
+    - shell: bash
+      # Commit the stamped H1(s) back so the reviewed state is the stamped state.
+      run: |
+        if ! git diff --quiet; then
+          git config user.name "rivet-bot"
+          git config user.email "rivet-bot@users.noreply.github.com"
+          git commit -am "rivet: stamp Jira keys"
+          git push
+        fi

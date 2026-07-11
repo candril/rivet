@@ -1,0 +1,17 @@
+{
+  "name": "@rivet/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "rivet": "./src/main.ts"
+  },
+  "scripts": {
+    "start": "bun run src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "bun build --compile --minify src/main.ts --outfile ../../bin/rivet"
+  },
+  "dependencies": {
+    "@rivet/core": "workspace:*"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "rivet",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "typecheck": "bun run --filter '*' typecheck",
+    "build:cli": "bun run --filter '@rivet/cli' build",
+    "build:actions": "bun run --filter '@rivet/actions' build",
+    "verify": "bun run apps/cli/src/main.ts verify ."
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/bun": "^1.1.0"
+  }
+}
