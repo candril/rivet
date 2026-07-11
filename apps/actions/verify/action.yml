@@ -1,19 +1,487 @@
-name: "rivet verify"
-description: "Gate PRs on Jira-key format, uniqueness, and immutability."
+name: 'rivet verify'
+description: 'Gate PRs on Jira-key format, uniqueness, and immutability (the key in each spec H1).'
+author: 'candril'
+
+inputs:
+  path:
+    description: 'Repo-relative root containing rivet.toml'
+    required: false
+    default: '.'
+
 runs:
-  using: composite
+  using: 'composite'
   steps:
-    - uses: oven-sh/setup-bun@v2
-      with:
-        bun-version: "1.3.3"
-    - shell: bash
-      run: bun install --frozen-lockfile
-    - shell: bash
-      # GITHUB_BASE_REF lets verify diff against the PR base for immutability;
-      # RIVET_PR_LABELS carries the `allow-key-change` escape hatch.
+    - name: Verify specs
+      uses: actions/github-script@v7
       env:
-        GITHUB_BASE_REF: ${{ github.base_ref }}
-        RIVET_PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
-      run: |
-        git fetch --no-tags --depth=1 origin "$GITHUB_BASE_REF"
-        bun run apps/cli/src/main.ts verify .
+        RIVET_ROOT: ${{ inputs.path }}
+      with:
+        script: |
+          // !! GENERATED — edit apps/actions/_src/verify.ts instead !!
+          // ../../packages/core/src/keys.ts
+          var KEY_SOURCE = "[A-Z][A-Z0-9]+-\\d+";
+          var KEY_REGEX = new RegExp(`^${KEY_SOURCE}$`);
+          var KEY_IN_TEXT = new RegExp(`(?<![A-Za-z0-9-])(${KEY_SOURCE})(?![A-Za-z0-9-])`);
+          function isKey(s) {
+            return KEY_REGEX.test(s);
+          }
+          function firstKey(text) {
+            const m = text.match(KEY_IN_TEXT);
+            return m ? m[1] : null;
+          }
+          var SEP = "[\\s.:·\\-–—]+";
+          var KEYISH = /^[A-Za-z][A-Za-z0-9]*-[A-Za-z0-9.]*\d/;
+          function parseH1(h1Raw, humanId) {
+            const heading = h1Raw.replace(/^#+\s*/, "").trim();
+            const key = firstKey(heading);
+            let afterId = heading;
+            if (humanId && afterId.startsWith(humanId)) {
+              afterId = afterId.slice(humanId.length).replace(new RegExp(`^\\s*${SEP}`), "");
+            }
+            const firstTok = afterId.match(/^(\S+)/)?.[1];
+            let candidate = null;
+            if (firstTok) {
+              const clean = firstTok.replace(/[^A-Za-z0-9.]+$/, "");
+              if (KEYISH.test(clean))
+                candidate = clean;
+            }
+            let title = heading;
+            if (humanId && title.startsWith(humanId)) {
+              title = title.slice(humanId.length).replace(new RegExp(`^\\s*${SEP}`), "");
+            }
+            if (key && title.startsWith(key)) {
+              title = title.slice(key.length).replace(new RegExp(`^\\s*${SEP}`), "");
+            }
+            title = title.trim() || heading;
+            return { key, candidate, title };
+          }
+          // ../../packages/core/src/config.ts
+          const { readFileSync } = require("node:fs");
+          const { resolve } = require("node:path");
+          function loadConfig(root = ".") {
+            const path = resolve(root, "rivet.toml");
+            return validateConfig(parseToml(readFileSync(path, "utf8")), path);
+          }
+          function validateConfig(raw, source = "rivet.toml") {
+            const fail = (m) => {
+              throw new Error(`${source}: ${m}`);
+            };
+            if (typeof raw.adapter !== "string")
+              fail("`adapter` must be a string");
+            if (!Array.isArray(raw.specs) || raw.specs.some((s) => typeof s !== "string")) {
+              fail("`specs` must be an array of strings");
+            }
+            if (typeof raw.project !== "string")
+              fail("`project` must be a string");
+            const baseUrl = process.env.JIRA_BASE_URL ?? raw.base_url;
+            if (typeof baseUrl !== "string" || !baseUrl) {
+              fail("`base_url` must be set in rivet.toml (or JIRA_BASE_URL in the env)");
+            }
+            const types2 = raw.types ?? {};
+            return {
+              adapter: raw.adapter,
+              specs: raw.specs,
+              project: raw.project,
+              baseUrl,
+              types: {
+                story: typeof types2.story === "string" ? types2.story : "Story",
+                task: typeof types2.task === "string" ? types2.task : "Task"
+              }
+            };
+          }
+          function parseToml(text) {
+            const root = {};
+            let table = root;
+            for (const rawLine of text.split(`
+          `)) {
+              const line = stripComment(rawLine).trim();
+              if (!line)
+                continue;
+              const header = line.match(/^\[([^\]]+)\]$/);
+              if (header) {
+                const obj = {};
+                root[header[1].trim()] = obj;
+                table = obj;
+                continue;
+              }
+              const eq = line.indexOf("=");
+              if (eq === -1)
+                continue;
+              table[line.slice(0, eq).trim()] = parseValue(line.slice(eq + 1).trim());
+            }
+            return root;
+          }
+          function stripComment(line) {
+            let inString = false;
+            let quote = "";
+            for (let i = 0;i < line.length; i++) {
+              const c = line[i];
+              if (inString) {
+                if (c === quote)
+                  inString = false;
+              } else if (c === '"' || c === "'") {
+                inString = true;
+                quote = c;
+              } else if (c === "#") {
+                return line.slice(0, i);
+              }
+            }
+            return line;
+          }
+          function parseValue(v) {
+            if (v.startsWith('"') && v.endsWith('"') || v.startsWith("'") && v.endsWith("'")) {
+              return v.slice(1, -1);
+            }
+            if (v.startsWith("[") && v.endsWith("]")) {
+              const inner = v.slice(1, -1).trim();
+              return inner ? splitTopLevel(inner).map((item) => parseValue(item.trim())) : [];
+            }
+            if (v === "true")
+              return true;
+            if (v === "false")
+              return false;
+            const n = Number(v);
+            return v !== "" && !Number.isNaN(n) ? n : v;
+          }
+          function splitTopLevel(s) {
+            const out = [];
+            let depth = 0;
+            let inString = false;
+            let quote = "";
+            let cur = "";
+            for (let i = 0;i < s.length; i++) {
+              const c = s[i];
+              if (inString) {
+                cur += c;
+                if (c === quote)
+                  inString = false;
+                continue;
+              }
+              if (c === '"' || c === "'") {
+                inString = true;
+                quote = c;
+              } else if (c === "[") {
+                depth++;
+              } else if (c === "]") {
+                depth--;
+              } else if (c === "," && depth === 0) {
+                out.push(cur);
+                cur = "";
+                continue;
+              }
+              cur += c;
+            }
+            if (cur.trim())
+              out.push(cur);
+            return out;
+          }
+          // ../../packages/core/src/adapters/shared.ts
+          const { existsSync, readdirSync, readFileSync: readFileSync2 } = require("node:fs");
+          const { join, relative } = require("node:path");
+          function readSpecFiles(root, specDirs) {
+            const out = [];
+            for (const dir of specDirs) {
+              const abs = join(root, dir);
+              if (!existsSync(abs))
+                continue;
+              for (const entry of readdirSync(abs, { withFileTypes: true })) {
+                if (!entry.isFile() || !entry.name.endsWith(".md"))
+                  continue;
+                const absPath = join(abs, entry.name);
+                out.push({
+                  absPath,
+                  relPath: relative(root, absPath).replace(/\\/g, "/"),
+                  content: readFileSync2(absPath, "utf8"),
+                  name: entry.name,
+                  dir
+                });
+              }
+            }
+            return out;
+          }
+          function firstH1(content) {
+            let inCode = false;
+            for (const line of content.split(`
+          `)) {
+              if (line.trimStart().startsWith("```")) {
+                inCode = !inCode;
+                continue;
+              }
+              if (inCode)
+                continue;
+              if (/^#\s+/.test(line))
+                return line.replace(/\s+$/, "");
+            }
+            return null;
+          }
+          function statusField(content) {
+            const m = content.match(/^\s*\*\*Status\*\*:\s*(.+?)\s*$/m);
+            return m ? m[1].trim().toLowerCase() : "";
+          }
+          function slugify(s) {
+            return s.toLowerCase().replace(/[^\w\s-]/g, "").trim().replace(/\s+/g, "-").replace(/-+/g, "-").slice(0, 60) || "spec";
+          }
+          
+          // ../../packages/core/src/adapters/lane.ts
+          var NUM_PREFIX = /^(\d{3,})[-_]/;
+          function laneKind(relPath) {
+            return /(^|\/)nfr\//.test(relPath) ? "task" : "story";
+          }
+          var laneAdapter = {
+            name: "lane",
+            parse(root, specDirs) {
+              const nodes = [];
+              for (const f of readSpecFiles(root, specDirs)) {
+                const h1 = firstH1(f.content) ?? "";
+                const humanId = f.name.match(NUM_PREFIX)?.[1] ?? null;
+                const { key, candidate, title } = parseH1(h1, humanId);
+                nodes.push({
+                  repoRelPath: f.relPath,
+                  humanId,
+                  key,
+                  keyCandidate: candidate,
+                  title,
+                  kind: laneKind(f.relPath),
+                  status: statusField(f.content),
+                  h1Raw: h1
+                });
+              }
+              return nodes;
+            },
+            scaffold(input, ctx) {
+              const dir = input.kind === "task" ? ctx.specDirs.find((d) => /(^|\/)nfr$/.test(d)) ?? ctx.specDirs[0] : ctx.specDirs.find((d) => !/(^|\/)nfr$/.test(d)) ?? ctx.specDirs[0];
+              const next = nextNumber(ctx, dir);
+              return {
+                path: `${dir}/${next}-${slugify(input.summary)}.md`,
+                contents: skeleton(input)
+              };
+            }
+          };
+          function nextNumber(ctx, dir) {
+            let max = 0;
+            for (const n of ctx.existing) {
+              if (!n.repoRelPath.startsWith(`${dir}/`))
+                continue;
+              const m = n.repoRelPath.slice(dir.length + 1).match(/^(\d{3,})/);
+              if (m)
+                max = Math.max(max, Number(m[1]));
+            }
+            return String(max + 1).padStart(3, "0");
+          }
+          function skeleton(input) {
+            return `# ${input.key} ${input.summary}
+          
+          **Status**: Draft
+          
+          ## Description
+          
+          TODO
+          
+          ## Capabilities
+          
+          ### P1 — Must Have
+          
+          - TODO
+          
+          ## Out of Scope
+          
+          - TODO
+          `;
+          }
+          
+          // ../../packages/core/src/adapters/dg.ts
+          var DG_NAME = /^ABO-(FR|NFR)-(\d{3,})_/;
+          function dgKind(tag) {
+            return tag === "FR" ? "story" : "task";
+          }
+          var dgAdapter = {
+            name: "dg",
+            parse(root, specDirs) {
+              const nodes = [];
+              for (const f of readSpecFiles(root, specDirs)) {
+                const m = f.name.match(DG_NAME);
+                if (!m)
+                  continue;
+                const humanId = `ABO-${m[1]}-${m[2]}`;
+                const h1 = firstH1(f.content) ?? "";
+                const { key, candidate, title } = parseH1(h1, humanId);
+                nodes.push({
+                  repoRelPath: f.relPath,
+                  humanId,
+                  key,
+                  keyCandidate: candidate,
+                  title,
+                  kind: dgKind(m[1]),
+                  status: statusField(f.content),
+                  h1Raw: h1
+                });
+              }
+              return nodes;
+            },
+            scaffold(input, ctx) {
+              const tag = input.kind === "story" ? "FR" : "NFR";
+              const dir = ctx.specDirs[0];
+              const humanId = `ABO-${tag}-${nextNumber2(ctx, tag)}`;
+              return {
+                path: `${dir}/${humanId}_${slugify(input.summary)}.md`,
+                contents: skeleton2(humanId, input)
+              };
+            }
+          };
+          function nextNumber2(ctx, tag) {
+            let max = 0;
+            for (const n of ctx.existing) {
+              if (!n.humanId?.startsWith(`ABO-${tag}-`))
+                continue;
+              const num = Number(n.humanId.slice(`ABO-${tag}-`.length));
+              if (Number.isFinite(num))
+                max = Math.max(max, num);
+            }
+            return String(max + 1).padStart(3, "0");
+          }
+          function skeleton2(humanId, input) {
+            return `# ${humanId} · ${input.key} ${input.summary}
+          
+          **Status**: Draft
+          
+          #### Context
+          
+          TODO
+          
+          #### Requirement
+          
+          TODO
+          
+          #### Acceptance Criteria
+          
+          TODO
+          
+          #### Out of Scope
+          
+          TODO
+          `;
+          }
+          
+          // ../../packages/core/src/adapters/index.ts
+          var REGISTRY = {
+            [laneAdapter.name]: laneAdapter,
+            [dgAdapter.name]: dgAdapter
+          };
+          function getAdapter(name) {
+            const adapter = REGISTRY[name];
+            if (!adapter) {
+              throw new Error(`unknown adapter "${name}" — known: ${Object.keys(REGISTRY).join(", ")}`);
+            }
+            return adapter;
+          }
+          // ../../packages/core/src/verify.ts
+          function checkFormat(nodes) {
+            const out = [];
+            for (const n of nodes) {
+              if (n.keyCandidate && !isKey(n.keyCandidate)) {
+                out.push({
+                  file: n.repoRelPath,
+                  level: "error",
+                  message: `malformed key "${n.keyCandidate}" — must match PREFIX-NNN (e.g. OSA-30303)`
+                });
+              }
+            }
+            return out;
+          }
+          function checkUniqueness(nodes) {
+            const out = [];
+            const seen = new Map;
+            for (const n of nodes) {
+              if (!n.key)
+                continue;
+              const prev = seen.get(n.key);
+              if (prev) {
+                out.push({ file: n.repoRelPath, level: "error", message: `duplicate key ${n.key} — also in ${prev}` });
+              } else {
+                seen.set(n.key, n.repoRelPath);
+              }
+            }
+            return out;
+          }
+          function checkImmutability(nodes, base, allowKeyChange) {
+            const out = [];
+            for (const n of nodes) {
+              if (!base.has(n.repoRelPath))
+                continue;
+              const was = base.get(n.repoRelPath) ?? null;
+              if (was && n.key !== was) {
+                out.push({
+                  file: n.repoRelPath,
+                  level: allowKeyChange ? "warning" : "error",
+                  message: `key changed ${was} → ${n.key ?? "(none)"}${allowKeyChange ? " (allowed by label)" : ""}`
+                });
+              }
+            }
+            return out;
+          }
+          function verifySpecs(nodes, base, opts = {}) {
+            return [
+              ...checkFormat(nodes),
+              ...checkUniqueness(nodes),
+              ...checkImmutability(nodes, base, opts.allowKeyChange ?? false)
+            ];
+          }
+          // ../../packages/core/src/mint.ts
+          var GATE = new Set(["ready", "approved"]);
+          // _src/verify.ts
+          var root = process.env.RIVET_ROOT || ".";
+          var config2 = loadConfig(root);
+          var adapter = getAdapter(config2.adapter);
+          var nodes = adapter.parse(root, config2.specs);
+          var pr = context.payload.pull_request;
+          var labels = (pr?.labels ?? []).map((l) => l.name);
+          var allowKeyChange = labels.includes("allow-key-change");
+          var base = new Map;
+          if (pr) {
+            const { owner, repo } = context.repo;
+            const specPaths = new Set(nodes.map((n) => n.repoRelPath));
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number: pr.number,
+              per_page: 100
+            });
+            for (const f of files) {
+              if (!specPaths.has(f.filename))
+                continue;
+              if (f.status === "added") {
+                base.set(f.filename, null);
+                continue;
+              }
+              try {
+                const res = await github.rest.repos.getContent({
+                  owner,
+                  repo,
+                  path: f.filename,
+                  ref: pr.base.sha,
+                  mediaType: { format: "raw" }
+                });
+                const text = res.data;
+                const h1 = text.split(`
+          `).find((l) => /^#\s+/.test(l));
+                base.set(f.filename, h1 ? firstKey(h1.replace(/^#+\s*/, "")) : null);
+              } catch (e) {
+                core.warning(`could not read base ${f.filename}: ${e.message}`);
+              }
+            }
+          }
+          var violations = verifySpecs(nodes, base, { allowKeyChange });
+          for (const v of violations) {
+            const msg = `${v.file}: ${v.message}`;
+            if (v.level === "error")
+              core.error(msg);
+            else
+              core.warning(msg);
+          }
+          var errors = violations.filter((v) => v.level === "error");
+          var tracked = nodes.filter((n) => n.key).length;
+          if (errors.length > 0) {
+            core.setFailed(`${errors.length} verify violation(s) across ${nodes.length} specs`);
+          } else {
+            core.info(`OK: ${nodes.length} specs (${tracked} tracked), no violations`);
+          }

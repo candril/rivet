@@ -1,26 +1,621 @@
-name: "rivet mint"
-description: "On the `create-jira` label, create issues for keyless Ready specs and stamp their H1s back to the PR branch."
+name: 'rivet mint'
+description: 'Preview keyless specs; on the create-jira label, create Jira issues and stamp their keys back to the PR branch.'
+author: 'candril'
+
+inputs:
+  path:
+    description: 'Repo-relative root containing rivet.toml'
+    required: false
+    default: '.'
+  jira-email:
+    description: 'Jira account email (Basic auth)'
+    required: true
+  jira-api-token:
+    description: 'Jira API token (Basic auth) — use a service-account secret'
+    required: true
+  jira-base-url:
+    description: 'Jira base URL; overrides rivet.toml base_url when set'
+    required: false
+    default: ''
+  label-issues:
+    description: 'Also add a rivet:<repo>/<id> label to each created issue'
+    required: false
+    default: 'false'
+  github-token:
+    description: 'Token for PR comments, label removal, and pushing the stamp commit'
+    required: false
+    default: ${{ github.token }}
+
 runs:
-  using: composite
+  using: 'composite'
   steps:
-    - uses: oven-sh/setup-bun@v2
-      with:
-        bun-version: "1.3.3"
-    - shell: bash
-      run: bun install --frozen-lockfile
-    - shell: bash
-      # Credentials come from repo/org secrets (a dedicated Jira service account).
+    - name: Mint specs
+      uses: actions/github-script@v7
       env:
-        JIRA_EMAIL: ${{ env.JIRA_EMAIL }}
-        JIRA_API_TOKEN: ${{ env.JIRA_API_TOKEN }}
-        JIRA_BASE_URL: ${{ env.JIRA_BASE_URL }}
-      run: bun run apps/cli/src/main.ts mint .
-    - shell: bash
-      # Commit the stamped H1(s) back so the reviewed state is the stamped state.
-      run: |
-        if ! git diff --quiet; then
-          git config user.name "rivet-bot"
-          git config user.email "rivet-bot@users.noreply.github.com"
-          git commit -am "rivet: stamp Jira keys"
-          git push
-        fi
+        RIVET_ROOT: ${{ inputs.path }}
+        JIRA_EMAIL: ${{ inputs.jira-email }}
+        JIRA_API_TOKEN: ${{ inputs.jira-api-token }}
+        JIRA_BASE_URL: ${{ inputs.jira-base-url }}
+        RIVET_LABEL: ${{ inputs.label-issues }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          // !! GENERATED — edit apps/actions/_src/mint.ts instead !!
+          // _src/mint.ts
+          const { readFileSync: readFileSync3, writeFileSync } = require("node:fs");
+          const { execFileSync } = require("node:child_process");
+          const { join: join2 } = require("node:path");
+          // ../../packages/core/src/keys.ts
+          var KEY_SOURCE = "[A-Z][A-Z0-9]+-\\d+";
+          var KEY_REGEX = new RegExp(`^${KEY_SOURCE}$`);
+          var KEY_IN_TEXT = new RegExp(`(?<![A-Za-z0-9-])(${KEY_SOURCE})(?![A-Za-z0-9-])`);
+          function firstKey(text) {
+            const m = text.match(KEY_IN_TEXT);
+            return m ? m[1] : null;
+          }
+          var SEP = "[\\s.:·\\-–—]+";
+          var KEYISH = /^[A-Za-z][A-Za-z0-9]*-[A-Za-z0-9.]*\d/;
+          function parseH1(h1Raw, humanId) {
+            const heading = h1Raw.replace(/^#+\s*/, "").trim();
+            const key = firstKey(heading);
+            let afterId = heading;
+            if (humanId && afterId.startsWith(humanId)) {
+              afterId = afterId.slice(humanId.length).replace(new RegExp(`^\\s*${SEP}`), "");
+            }
+            const firstTok = afterId.match(/^(\S+)/)?.[1];
+            let candidate = null;
+            if (firstTok) {
+              const clean = firstTok.replace(/[^A-Za-z0-9.]+$/, "");
+              if (KEYISH.test(clean))
+                candidate = clean;
+            }
+            let title = heading;
+            if (humanId && title.startsWith(humanId)) {
+              title = title.slice(humanId.length).replace(new RegExp(`^\\s*${SEP}`), "");
+            }
+            if (key && title.startsWith(key)) {
+              title = title.slice(key.length).replace(new RegExp(`^\\s*${SEP}`), "");
+            }
+            title = title.trim() || heading;
+            return { key, candidate, title };
+          }
+          function stampKey(h1Raw, key, humanId) {
+            const { title } = parseH1(h1Raw, humanId);
+            const head = humanId ? `${humanId} · ${key}` : key;
+            return `# ${head}${title ? ` ${title}` : ""}`;
+          }
+          // ../../packages/core/src/jira.ts
+          class JiraError extends Error {
+            status;
+            constructor(status, message) {
+              super(message);
+              this.status = status;
+              this.name = "JiraError";
+            }
+          }
+          var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          
+          class JiraClient {
+            baseUrl;
+            auth;
+            fetch;
+            maxRetries;
+            constructor(opts) {
+              this.baseUrl = opts.baseUrl.replace(/\/$/, "");
+              this.auth = `Basic ${btoa(`${opts.email}:${opts.token}`)}`;
+              this.fetch = opts.fetch ?? globalThis.fetch.bind(globalThis);
+              this.maxRetries = opts.maxRetries ?? 3;
+            }
+            async createIssue(input) {
+              const res = await this.request("/rest/api/3/issue", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  fields: {
+                    project: { key: input.projectKey },
+                    issuetype: { name: input.type },
+                    summary: input.summary
+                  }
+                })
+              });
+              const body = await this.json(res);
+              return { key: body.key, url: `${this.baseUrl}/browse/${body.key}` };
+            }
+            async getIssue(key) {
+              const res = await this.request(`/rest/api/3/issue/${encodeURIComponent(key)}?fields=summary,issuetype,status`, { method: "GET" });
+              if (res.status === 404)
+                return null;
+              const body = await this.json(res);
+              return toIssue(body);
+            }
+            async addLabel(key, label) {
+              const res = await this.request(`/rest/api/3/issue/${encodeURIComponent(key)}`, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ update: { labels: [{ add: label }] } })
+              });
+              if (!res.ok)
+                await this.json(res);
+            }
+            async search(jql, maxResults = 100) {
+              const res = await this.request("/rest/api/3/search", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ jql, maxResults, fields: ["summary", "issuetype", "status"] })
+              });
+              const body = await this.json(res);
+              return (body.issues ?? []).map(toIssue);
+            }
+            async request(path, init) {
+              for (let attempt = 0;; attempt++) {
+                const res = await this.fetch(`${this.baseUrl}${path}`, {
+                  ...init,
+                  headers: { Authorization: this.auth, Accept: "application/json", ...init.headers ?? {} }
+                });
+                if ((res.status === 429 || res.status >= 500) && attempt < this.maxRetries) {
+                  const retryAfter = Number(res.headers.get("retry-after"));
+                  const delay = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 2 ** attempt * 500;
+                  await sleep(delay);
+                  continue;
+                }
+                return res;
+              }
+            }
+            async json(res) {
+              if (!res.ok) {
+                const body = await res.json().catch(() => null);
+                const msg = body?.errorMessages?.join("; ") || body?.errors && Object.values(body.errors).join("; ") || res.statusText;
+                throw new JiraError(res.status, msg);
+              }
+              return res.json();
+            }
+          }
+          function toIssue(w) {
+            return {
+              key: w.key,
+              type: w.fields.issuetype.name,
+              summary: w.fields.summary,
+              statusCategory: w.fields.status?.statusCategory?.key ?? "unknown"
+            };
+          }
+          // ../../packages/core/src/config.ts
+          const { readFileSync } = require("node:fs");
+          const { resolve } = require("node:path");
+          function loadConfig(root = ".") {
+            const path = resolve(root, "rivet.toml");
+            return validateConfig(parseToml(readFileSync(path, "utf8")), path);
+          }
+          function validateConfig(raw, source = "rivet.toml") {
+            const fail = (m) => {
+              throw new Error(`${source}: ${m}`);
+            };
+            if (typeof raw.adapter !== "string")
+              fail("`adapter` must be a string");
+            if (!Array.isArray(raw.specs) || raw.specs.some((s) => typeof s !== "string")) {
+              fail("`specs` must be an array of strings");
+            }
+            if (typeof raw.project !== "string")
+              fail("`project` must be a string");
+            const baseUrl = process.env.JIRA_BASE_URL ?? raw.base_url;
+            if (typeof baseUrl !== "string" || !baseUrl) {
+              fail("`base_url` must be set in rivet.toml (or JIRA_BASE_URL in the env)");
+            }
+            const types2 = raw.types ?? {};
+            return {
+              adapter: raw.adapter,
+              specs: raw.specs,
+              project: raw.project,
+              baseUrl,
+              types: {
+                story: typeof types2.story === "string" ? types2.story : "Story",
+                task: typeof types2.task === "string" ? types2.task : "Task"
+              }
+            };
+          }
+          function parseToml(text) {
+            const root = {};
+            let table = root;
+            for (const rawLine of text.split(`
+          `)) {
+              const line = stripComment(rawLine).trim();
+              if (!line)
+                continue;
+              const header = line.match(/^\[([^\]]+)\]$/);
+              if (header) {
+                const obj = {};
+                root[header[1].trim()] = obj;
+                table = obj;
+                continue;
+              }
+              const eq = line.indexOf("=");
+              if (eq === -1)
+                continue;
+              table[line.slice(0, eq).trim()] = parseValue(line.slice(eq + 1).trim());
+            }
+            return root;
+          }
+          function stripComment(line) {
+            let inString = false;
+            let quote = "";
+            for (let i = 0;i < line.length; i++) {
+              const c = line[i];
+              if (inString) {
+                if (c === quote)
+                  inString = false;
+              } else if (c === '"' || c === "'") {
+                inString = true;
+                quote = c;
+              } else if (c === "#") {
+                return line.slice(0, i);
+              }
+            }
+            return line;
+          }
+          function parseValue(v) {
+            if (v.startsWith('"') && v.endsWith('"') || v.startsWith("'") && v.endsWith("'")) {
+              return v.slice(1, -1);
+            }
+            if (v.startsWith("[") && v.endsWith("]")) {
+              const inner = v.slice(1, -1).trim();
+              return inner ? splitTopLevel(inner).map((item) => parseValue(item.trim())) : [];
+            }
+            if (v === "true")
+              return true;
+            if (v === "false")
+              return false;
+            const n = Number(v);
+            return v !== "" && !Number.isNaN(n) ? n : v;
+          }
+          function splitTopLevel(s) {
+            const out = [];
+            let depth = 0;
+            let inString = false;
+            let quote = "";
+            let cur = "";
+            for (let i = 0;i < s.length; i++) {
+              const c = s[i];
+              if (inString) {
+                cur += c;
+                if (c === quote)
+                  inString = false;
+                continue;
+              }
+              if (c === '"' || c === "'") {
+                inString = true;
+                quote = c;
+              } else if (c === "[") {
+                depth++;
+              } else if (c === "]") {
+                depth--;
+              } else if (c === "," && depth === 0) {
+                out.push(cur);
+                cur = "";
+                continue;
+              }
+              cur += c;
+            }
+            if (cur.trim())
+              out.push(cur);
+            return out;
+          }
+          // ../../packages/core/src/adapters/shared.ts
+          const { existsSync, readdirSync, readFileSync: readFileSync2 } = require("node:fs");
+          const { join, relative } = require("node:path");
+          function readSpecFiles(root, specDirs) {
+            const out = [];
+            for (const dir of specDirs) {
+              const abs = join(root, dir);
+              if (!existsSync(abs))
+                continue;
+              for (const entry of readdirSync(abs, { withFileTypes: true })) {
+                if (!entry.isFile() || !entry.name.endsWith(".md"))
+                  continue;
+                const absPath = join(abs, entry.name);
+                out.push({
+                  absPath,
+                  relPath: relative(root, absPath).replace(/\\/g, "/"),
+                  content: readFileSync2(absPath, "utf8"),
+                  name: entry.name,
+                  dir
+                });
+              }
+            }
+            return out;
+          }
+          function firstH1(content) {
+            let inCode = false;
+            for (const line of content.split(`
+          `)) {
+              if (line.trimStart().startsWith("```")) {
+                inCode = !inCode;
+                continue;
+              }
+              if (inCode)
+                continue;
+              if (/^#\s+/.test(line))
+                return line.replace(/\s+$/, "");
+            }
+            return null;
+          }
+          function statusField(content) {
+            const m = content.match(/^\s*\*\*Status\*\*:\s*(.+?)\s*$/m);
+            return m ? m[1].trim().toLowerCase() : "";
+          }
+          function slugify(s) {
+            return s.toLowerCase().replace(/[^\w\s-]/g, "").trim().replace(/\s+/g, "-").replace(/-+/g, "-").slice(0, 60) || "spec";
+          }
+          
+          // ../../packages/core/src/adapters/lane.ts
+          var NUM_PREFIX = /^(\d{3,})[-_]/;
+          function laneKind(relPath) {
+            return /(^|\/)nfr\//.test(relPath) ? "task" : "story";
+          }
+          var laneAdapter = {
+            name: "lane",
+            parse(root, specDirs) {
+              const nodes = [];
+              for (const f of readSpecFiles(root, specDirs)) {
+                const h1 = firstH1(f.content) ?? "";
+                const humanId = f.name.match(NUM_PREFIX)?.[1] ?? null;
+                const { key, candidate, title } = parseH1(h1, humanId);
+                nodes.push({
+                  repoRelPath: f.relPath,
+                  humanId,
+                  key,
+                  keyCandidate: candidate,
+                  title,
+                  kind: laneKind(f.relPath),
+                  status: statusField(f.content),
+                  h1Raw: h1
+                });
+              }
+              return nodes;
+            },
+            scaffold(input, ctx) {
+              const dir = input.kind === "task" ? ctx.specDirs.find((d) => /(^|\/)nfr$/.test(d)) ?? ctx.specDirs[0] : ctx.specDirs.find((d) => !/(^|\/)nfr$/.test(d)) ?? ctx.specDirs[0];
+              const next = nextNumber(ctx, dir);
+              return {
+                path: `${dir}/${next}-${slugify(input.summary)}.md`,
+                contents: skeleton(input)
+              };
+            }
+          };
+          function nextNumber(ctx, dir) {
+            let max = 0;
+            for (const n of ctx.existing) {
+              if (!n.repoRelPath.startsWith(`${dir}/`))
+                continue;
+              const m = n.repoRelPath.slice(dir.length + 1).match(/^(\d{3,})/);
+              if (m)
+                max = Math.max(max, Number(m[1]));
+            }
+            return String(max + 1).padStart(3, "0");
+          }
+          function skeleton(input) {
+            return `# ${input.key} ${input.summary}
+          
+          **Status**: Draft
+          
+          ## Description
+          
+          TODO
+          
+          ## Capabilities
+          
+          ### P1 — Must Have
+          
+          - TODO
+          
+          ## Out of Scope
+          
+          - TODO
+          `;
+          }
+          
+          // ../../packages/core/src/adapters/dg.ts
+          var DG_NAME = /^ABO-(FR|NFR)-(\d{3,})_/;
+          function dgKind(tag) {
+            return tag === "FR" ? "story" : "task";
+          }
+          var dgAdapter = {
+            name: "dg",
+            parse(root, specDirs) {
+              const nodes = [];
+              for (const f of readSpecFiles(root, specDirs)) {
+                const m = f.name.match(DG_NAME);
+                if (!m)
+                  continue;
+                const humanId = `ABO-${m[1]}-${m[2]}`;
+                const h1 = firstH1(f.content) ?? "";
+                const { key, candidate, title } = parseH1(h1, humanId);
+                nodes.push({
+                  repoRelPath: f.relPath,
+                  humanId,
+                  key,
+                  keyCandidate: candidate,
+                  title,
+                  kind: dgKind(m[1]),
+                  status: statusField(f.content),
+                  h1Raw: h1
+                });
+              }
+              return nodes;
+            },
+            scaffold(input, ctx) {
+              const tag = input.kind === "story" ? "FR" : "NFR";
+              const dir = ctx.specDirs[0];
+              const humanId = `ABO-${tag}-${nextNumber2(ctx, tag)}`;
+              return {
+                path: `${dir}/${humanId}_${slugify(input.summary)}.md`,
+                contents: skeleton2(humanId, input)
+              };
+            }
+          };
+          function nextNumber2(ctx, tag) {
+            let max = 0;
+            for (const n of ctx.existing) {
+              if (!n.humanId?.startsWith(`ABO-${tag}-`))
+                continue;
+              const num = Number(n.humanId.slice(`ABO-${tag}-`.length));
+              if (Number.isFinite(num))
+                max = Math.max(max, num);
+            }
+            return String(max + 1).padStart(3, "0");
+          }
+          function skeleton2(humanId, input) {
+            return `# ${humanId} · ${input.key} ${input.summary}
+          
+          **Status**: Draft
+          
+          #### Context
+          
+          TODO
+          
+          #### Requirement
+          
+          TODO
+          
+          #### Acceptance Criteria
+          
+          TODO
+          
+          #### Out of Scope
+          
+          TODO
+          `;
+          }
+          
+          // ../../packages/core/src/adapters/index.ts
+          var REGISTRY = {
+            [laneAdapter.name]: laneAdapter,
+            [dgAdapter.name]: dgAdapter
+          };
+          function getAdapter(name) {
+            const adapter = REGISTRY[name];
+            if (!adapter) {
+              throw new Error(`unknown adapter "${name}" — known: ${Object.keys(REGISTRY).join(", ")}`);
+            }
+            return adapter;
+          }
+          // ../../packages/core/src/mint.ts
+          var GATE = new Set(["ready", "approved"]);
+          function passesGate(status) {
+            return GATE.has(status.toLowerCase());
+          }
+          function issueType(node, config) {
+            return node.kind === "story" ? config.types.story : config.types.task;
+          }
+          function mintCandidates(nodes, config) {
+            return nodes.filter((n) => n.key === null && passesGate(n.status)).map((n) => ({ node: n, type: issueType(n, config), project: config.project }));
+          }
+          async function mintOne(jira2, node, config) {
+            if (node.key)
+              throw new Error(`${node.repoRelPath} already carries key ${node.key}`);
+            const { key, url } = await jira2.createIssue({
+              projectKey: config.project,
+              type: issueType(node, config),
+              summary: node.title
+            });
+            return { node, key, url, newH1: stampKey(node.h1Raw, key, node.humanId) };
+          }
+          // _src/mint.ts
+          var MINT_LABEL = "create-jira";
+          var COMMENT_MARKER = "<!-- rivet-mint -->";
+          var root = process.env.RIVET_ROOT || ".";
+          var config2 = loadConfig(root);
+          var adapter = getAdapter(config2.adapter);
+          var pr = context.payload.pull_request;
+          if (!pr) {
+            core.info("not a pull_request event — nothing to do");
+          } else {
+            const { owner, repo } = context.repo;
+            const labels = (pr.labels ?? []).map((l) => l.name);
+            const candidates = mintCandidates(adapter.parse(root, config2.specs), config2);
+            if (!labels.includes(MINT_LABEL)) {
+              await upsertComment(owner, repo, pr.number, previewBody(candidates));
+            } else if (candidates.length === 0) {
+              await upsertComment(owner, repo, pr.number, `${COMMENT_MARKER}
+          Nothing to mint — no keyless Ready/approved specs.`);
+              await removeLabel(owner, repo, pr.number);
+            } else if (pr.head.repo.full_name !== `${owner}/${repo}`) {
+              core.setFailed("fork PR: rivet cannot push stamped H1s to the head branch — use an in-repo branch.");
+            } else {
+              await mint2(candidates, owner, repo, pr);
+              await removeLabel(owner, repo, pr.number);
+            }
+          }
+          async function mint2(candidates, owner, repo, pr2) {
+            const jira2 = new JiraClient({
+              email: reqEnv("JIRA_EMAIL"),
+              token: reqEnv("JIRA_API_TOKEN"),
+              baseUrl: config2.baseUrl
+            });
+            const labelIssues = (process.env.RIVET_LABEL ?? "").toLowerCase() === "true";
+            const minted = [];
+            for (const c of candidates) {
+              const result = await mintOne(jira2, c.node, config2);
+              const abs = join2(root, c.node.repoRelPath);
+              writeFileSync(abs, readFileSync3(abs, "utf8").replace(c.node.h1Raw, result.newH1));
+              if (labelIssues) {
+                const ref = c.node.humanId ?? c.node.repoRelPath;
+                await jira2.addLabel(result.key, `rivet:${owner}/${repo}/${ref}`);
+              }
+              minted.push(`${result.key} → ${c.node.repoRelPath}`);
+              core.info(`minted ${result.key} → ${c.node.repoRelPath} (${result.url})`);
+            }
+            git(["config", "user.name", "rivet-bot"]);
+            git(["config", "user.email", "rivet-bot@users.noreply.github.com"]);
+            git(["commit", "-am", "rivet: stamp Jira keys"]);
+            git(["push", "origin", `HEAD:${pr2.head.ref}`]);
+            await upsertComment(owner, repo, pr2.number, `${COMMENT_MARKER}
+          Minted and stamped:
+          
+          ${minted.map((m) => `- ${m}`).join(`
+          `)}`);
+          }
+          function previewBody(candidates) {
+            if (candidates.length === 0) {
+              return `${COMMENT_MARKER}
+          No keyless Ready/approved specs to mint.`;
+            }
+            const rows = candidates.map((c) => `| \`${c.node.repoRelPath}\` | ${c.type} | ${c.project} |`).join(`
+          `);
+            return `${COMMENT_MARKER}
+          ### rivet — specs ready to mint
+          
+          Add the **\`${MINT_LABEL}\`** label to create these Jira issues and stamp their keys back into this PR.
+          
+          | Spec | Type | Project |
+          | --- | --- | --- |
+          ${rows}`;
+          }
+          async function upsertComment(owner, repo, issue, body) {
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: issue,
+              per_page: 100
+            });
+            const existing = comments.find((c) => c.body?.includes(COMMENT_MARKER));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: issue, body });
+            }
+          }
+          async function removeLabel(owner, repo, issue) {
+            try {
+              await github.rest.issues.removeLabel({ owner, repo, issue_number: issue, name: MINT_LABEL });
+            } catch (e) {
+              core.warning(`could not remove ${MINT_LABEL} label: ${e.message}`);
+            }
+          }
+          function git(args) {
+            execFileSync("git", args, { cwd: root, stdio: "inherit" });
+          }
+          function reqEnv(name) {
+            const v = process.env[name];
+            if (!v)
+              throw new Error(`${name} is required for minting (set it as an Action input/secret)`);
+            return v;
+          }

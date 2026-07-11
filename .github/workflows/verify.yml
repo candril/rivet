@@ -1,0 +1,15 @@
+name: verify
+on:
+  pull_request:
+
+# github-script needs to read PR files for the immutability check.
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./apps/actions/verify

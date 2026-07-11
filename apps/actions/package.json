@@ -4,7 +4,15 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "typecheck": "echo 'actions are composite YAML — no TypeScript to check'",
-    "build": "echo 'composite actions call the CLI directly — nothing to bundle yet'"
+    "build": "bun run build.ts",
+    "check": "bun run build.ts && git diff --exit-code verify/action.yml mint/action.yml",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@rivet/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@actions/core": "^1.11.1",
+    "@actions/github": "^6.0.0"
   }
 }
